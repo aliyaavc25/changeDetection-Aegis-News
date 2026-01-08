@@ -1,0 +1,11 @@
+[project]
+name = "aegis-api"
+version = "0.1.0"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "boto3",           # For AWS communication
+    "python-dotenv",
+    "httpx",           # To call the Scraper Project
+]
+requires-python = ">=3.11"
