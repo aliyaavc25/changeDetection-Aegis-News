@@ -19,7 +19,4 @@ in C:\xxx\yyy\changedetection\scrap-graph, "uv run .\worker.py"
 
 for example, you put your code in in C:\xxx\yyy\changedetection\changedetect
 (a) create directory "news_monitor" in C:\xxx\yyy\changedetection\
-(b) in C:\xxx\yyy\changedetection\changedetect", issue "uv tool run changedetection.io -d C:\Users\admin\Documents\aliya\changedetection\news_monitor -p 5000"
-
- 
-
+(b) in C:\xxx\yyy\changedetection\changedetect", issue "uv tool run --python 3.11 --with setuptools changedetection.io -d ..\news_monitor -p 5000"
