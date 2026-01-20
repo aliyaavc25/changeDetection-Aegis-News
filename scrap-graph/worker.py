@@ -13,7 +13,8 @@ from pydantic import BaseModel
 from langchain_aws import ChatBedrockConverse
 from langchain_core.messages import HumanMessage
 
-from pymongo import MongoClient
+import boto3
+from boto3.dynamodb.conditions import Key
 from datetime import datetime, timezone
 from urllib.parse import urljoin
 
@@ -22,20 +23,23 @@ from urllib.parse import urljoin
 # --------------------
 load_dotenv()
 
-AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-AWS_DEFAULT_REGION = os.getenv("AWS_DEFAULT_REGION")
+#AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+#AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+#AWS_DEFAULT_REGION = os.getenv("AWS_DEFAULT_REGION")
 
-MONGO_URI = os.getenv("MONGO_URI")
-DB_NAME = "newsDB"
 
-if not all([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION]):
-    print("❌ Missing AWS credentials in environment variables!")
-    sys.exit(1)
 
-mongo_client = MongoClient(MONGO_URI)
-mongo_db = mongo_client[DB_NAME]
-scraped_news_collection = mongo_db["scraped_news"]
+#if not all([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION]):
+ #   print("❌ Missing AWS credentials in environment variables!")
+   # sys.exit(1)
+
+AWS_REGION = "ap-southeast-5"
+
+dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
+
+NEWS_SITES_TABLE = dynamodb.Table("aegis_news_sites")
+REGIONAL_NEWS_TABLE = dynamodb.Table("aegis_regional_daily_news")
+
 
 # --------------------
 # STEP 2: COMPAT PATCH
@@ -77,8 +81,8 @@ from scrapegraphai.graphs import SmartScraperGraph
 # STEP 3: BEDROCK
 # --------------------
 bedrock_llm = ChatBedrockConverse(
-    model_id="us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-    region_name="us-east-1",
+    model_id="global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    region_name="ap-southeast-5",
     temperature=0,
     max_tokens=2048,
 )
@@ -88,9 +92,13 @@ GRAPH_CONFIG = {
         "model_instance": bedrock_llm,
         "model_tokens": 8192,
     },
-    "headless": False,
+    "headless": True,
     "stealth": True,
-    "browser_args": ["--no-cache"],
+    "browser_args": [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+    ],
     "verbose": True,
 }
 
@@ -120,12 +128,7 @@ class ScrapeRequest(BaseModel):
 RESULTS_DIR = "results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
-def load_existing_articles(site_name: str) -> List[Dict[str, Any]]:
-    cursor = scraped_news_collection.find(
-        {"source": site_name},
-        {"_id": 0}
-    )
-    return list(cursor)
+
 
 def normalize_date(date_str: str) -> str:
     """
@@ -140,65 +143,47 @@ def normalize_date(date_str: str) -> str:
         return datetime.utcnow().strftime("%Y-%m-%d")
 
 def load_articles_by_region_date(region: str, date_str: str) -> List[Dict[str, Any]]:
-    doc = scraped_news_collection.find_one(
-        {"region": region, "date": date_str},
-        {"_id": 0}
+    response = REGIONAL_NEWS_TABLE.query(
+        KeyConditionExpression=Key("region").eq(region),
+        ScanIndexForward=False
     )
-    return doc.get("news", []) if doc else []
+
+    for item in response.get("Items", []):
+        if item.get("date") == date_str:
+            return item.get("news", [])
+
+    return []
+
 
 def save_articles(site_name: str, articles: List[Dict[str, Any]], region: str):
-    """
-    Save exactly like Code 1:
-    - region + date based MongoDB
-    - local JSON file
-    """
-    valid_articles = [
-        {
-            "title": a.get("title"),
-            "details": a.get("details"),
-            "date": a.get("date"),
-            "category": a.get("category", []),
-            "source": site_name,
-            "url":  a.get("source_url") or a.get("url")
-        }
-        for a in articles
-        if a.get("title") or a.get("details")
-    ]
+    date_key = normalize_date(datetime.utcnow().isoformat())
+    generated_at = datetime.utcnow().isoformat() + "Z"
 
-    final_output = {
-        "region": region,
-        "generatedAt": datetime.utcnow().isoformat() + "Z",
-        "count": len(valid_articles),
-        "news": valid_articles
-    }
-
-    # Save to MongoDB (region+date)
-    date_key = normalize_date(datetime.now(timezone.utc).isoformat())
     existing_news = load_articles_by_region_date(region, date_key)
-
     existing_urls = {a.get("url") for a in existing_news if a.get("url")}
-    new_articles = [a for a in valid_articles if a.get("url") not in existing_urls]
+
+    new_articles = [
+        a for a in articles
+        if a.get("url") not in existing_urls
+    ]
 
     final_news = existing_news + new_articles
 
-    final_doc = {
+    item = {
         "region": region,
+        "generatedAt": generated_at,
         "date": date_key,
-        "generatedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "count": len(final_news),
         "news": final_news
     }
 
-    scraped_news_collection.update_one(
-        {"region": region, "date": date_key},
-        {"$set": final_doc},
-        upsert=True
-    )
+    REGIONAL_NEWS_TABLE.put_item(Item=item)
 
-    # Save locally like Code 1
+    # local backup (unchanged)
     local_path = os.path.join(RESULTS_DIR, f"{site_name.lower()}.json")
     with open(local_path, "w", encoding="utf-8") as f:
-        json.dump(final_doc, f, ensure_ascii=False, indent=4)
+        json.dump(item, f, ensure_ascii=False, indent=4)
+
 
 def merge_new_articles(existing, new):
     existing_valid = [a for a in existing if isinstance(a, dict)]
@@ -218,17 +203,20 @@ def merge_new_articles(existing, new):
 # NEWS EXTRACTOR
 # --------------------
 class NewsExtractor:
-    def __init__(self, db):
-        self.collection = db["news_site"]
-
     def process_url(self, url: str) -> Dict[str, Any]:
-        for site in self.collection.find({}, {"_id": 0}):
-            if site["domain"] in url.lower():
-                return site
-        return {
-            "prompt": "Summarize this news page into a JSON object with title and content.",
-            "region": "Unknown"
-        }
+        domain = url.split("//")[-1].split("/")[0].lower()
+
+        try:
+            response = NEWS_SITES_TABLE.get_item(
+                Key={"domain": domain}
+            )
+            return response["Item"]
+        except KeyError:
+            return {
+                "prompt": "Summarize this news page into a JSON object with title and content.",
+                "region": "Unknown"
+            }
+
 
 # --------------------
 # SCHEMAS
@@ -283,7 +271,8 @@ async def classify_category(title: str, snippet: str) -> List[str]:
 # --------------------
 async def scrape_site(site_name: str, site_url: str):
     try:
-        extractor = NewsExtractor(mongo_db)
+        extractor = NewsExtractor()
+
         metadata = extractor.process_url(site_url)
 
         list_prompt = """
