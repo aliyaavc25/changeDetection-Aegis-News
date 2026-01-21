@@ -142,47 +142,66 @@ def normalize_date(date_str: str) -> str:
     except Exception:
         return datetime.utcnow().strftime("%Y-%m-%d")
 
-def load_articles_by_region_date(region: str, date_str: str) -> List[Dict[str, Any]]:
-    response = REGIONAL_NEWS_TABLE.query(
-        KeyConditionExpression=Key("region").eq(region),
-        ScanIndexForward=False
-    )
-
-    for item in response.get("Items", []):
-        if item.get("date") == date_str:
-            return item.get("news", [])
-
-    return []
 
 
 def save_articles(site_name: str, articles: List[Dict[str, Any]], region: str):
     date_key = normalize_date(datetime.utcnow().isoformat())
-    generated_at = datetime.utcnow().isoformat() + "Z"
+    
+    print(f"\n🔹 [DEBUG] save_articles called for site: {site_name}")
+    print(f"    Region: {region}, Date Key: {date_key}")
+    print(f"    Total articles scraped: {len(articles)}")
+    
+    # 1️⃣ Load existing item
+    try:
+        response = REGIONAL_NEWS_TABLE.get_item(
+            Key={"region": region, "generatedAt": date_key}
+        )
+    except Exception as e:
+        print("❌ Error fetching existing item from DynamoDB:", e)
+        response = {}
 
-    existing_news = load_articles_by_region_date(region, date_key)
+    existing_item = response.get("Item")
+    existing_news = existing_item.get("news", []) if existing_item else []
+    print(f"    Existing articles in DynamoDB: {len(existing_news)}")
+    
+    # 2️⃣ De-duplicate by URL
     existing_urls = {a.get("url") for a in existing_news if a.get("url")}
+    new_articles = [a for a in articles if a.get("url") not in existing_urls]
 
-    new_articles = [
-        a for a in articles
-        if a.get("url") not in existing_urls
-    ]
+    print(f"    New articles to insert: {len(new_articles)}")
+    if new_articles:
+        for a in new_articles:
+            print(f"        ✅ {a.get('title')} ({a.get('url')})")
+    else:
+        print("    ⚠️ No new articles to insert (all duplicates or missing URLs)")
+        return
 
-    final_news = existing_news + new_articles
+    # 3️⃣ Update ONLY if new news exists
+    try:
+        REGIONAL_NEWS_TABLE.update_item(
+            Key={"region": region, "generatedAt": date_key},
+            UpdateExpression="""
+                SET #news = list_append(if_not_exists(#news, :empty), :new),
+                    #count = if_not_exists(#count, :zero) + :inc,
+                    #date = :date
+            """,
+            ExpressionAttributeNames={
+                "#news": "news",
+                "#count": "count",
+                "#date": "date",
+            },
+            ExpressionAttributeValues={
+                ":new": new_articles,
+                ":empty": [],
+                ":inc": len(new_articles),
+                ":zero": 0,
+                ":date": date_key,
+            },
+        )
+        print(f"    ✅ Successfully updated DynamoDB with {len(new_articles)} new articles")
+    except Exception as e:
+        print("❌ Error updating DynamoDB:", e)
 
-    item = {
-        "region": region,
-        "generatedAt": generated_at,
-        "date": date_key,
-        "count": len(final_news),
-        "news": final_news
-    }
-
-    REGIONAL_NEWS_TABLE.put_item(Item=item)
-
-    # local backup (unchanged)
-    local_path = os.path.join(RESULTS_DIR, f"{site_name.lower()}.json")
-    with open(local_path, "w", encoding="utf-8") as f:
-        json.dump(item, f, ensure_ascii=False, indent=4)
 
 
 def merge_new_articles(existing, new):
@@ -206,16 +225,29 @@ class NewsExtractor:
     def process_url(self, url: str) -> Dict[str, Any]:
         domain = url.split("//")[-1].split("/")[0].lower()
 
+        # ✅ FIX: normalize domain key
+        if domain.startswith("www."):
+            domain = domain.replace("www.", "", 1)
+
         try:
-            response = NEWS_SITES_TABLE.get_item(
-                Key={"domain": domain}
-            )
-            return response["Item"]
+            response = NEWS_SITES_TABLE.get_item(Key={"domain": domain})
+            item = response["Item"]
+
+            metadata = {}
+            for k, v in item.items():
+                if isinstance(v, dict) and "S" in v:
+                    metadata[k] = v["S"]
+                else:
+                    metadata[k] = v
+
+            return metadata
+
         except KeyError:
             return {
                 "prompt": "Summarize this news page into a JSON object with title and content.",
                 "region": "Unknown"
             }
+
 
 
 # --------------------
@@ -332,8 +364,9 @@ async def scrape_site(site_name: str, site_url: str):
             except Exception:
                 traceback.print_exc()
 
-        existing = load_existing_articles(site_name)
-        merged = merge_new_articles(existing, all_articles)
+        # DynamoDB version: dedupe using today's region data
+        
+
 
         final_news = [
             {
@@ -342,11 +375,12 @@ async def scrape_site(site_name: str, site_url: str):
                 "source": site_name,
                 "title": a.get("title"),
                 "category": a.get("category", []),
-                "url":  a.get("source_url") or a.get("url")
+                "url": a.get("source_url")
             }
-            for a in merged
+            for a in all_articles
             if a.get("title") or a.get("details")
         ]
+
 
         # Save exactly like Code 1
         save_articles(site_name, final_news, metadata.get("region", "Unknown"))
@@ -359,18 +393,20 @@ async def scrape_site(site_name: str, site_url: str):
 # --------------------
 # API ENDPOINT
 # --------------------
+async def scrape_background(request: ScrapeRequest):
+    try:
+        site_name = request.url.split("//")[-1].split("/")[0]
+        await scrape_site(site_name, request.url)
+    except Exception:
+        traceback.print_exc()
+
+
 @app.post("/scrape")
 async def run_scrape(request: ScrapeRequest):
-    try:
-        print(f"🔍 Starting scrape for {request.url}")
-        site_name = request.url.split("//")[-1].split("/")[0]
-        articles = await scrape_site(site_name, request.url)
-        return {"status": "success", "data": articles}
+    print(f"📥 Scrape job accepted for {request.url}")
+    asyncio.create_task(scrape_background(request))
+    return {"status": "accepted"}
 
-    except Exception as e:
-        print("❌ FATAL ERROR in main scraping process")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
 
 # --------------------
 # ENTRY POINT
