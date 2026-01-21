@@ -16,7 +16,8 @@ from langchain_core.messages import HumanMessage
 import boto3
 from boto3.dynamodb.conditions import Key
 from datetime import datetime, timezone
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
+
 
 # --------------------
 # STEP 1: LOAD ENV
@@ -223,7 +224,19 @@ def merge_new_articles(existing, new):
 # --------------------
 class NewsExtractor:
     def process_url(self, url: str) -> Dict[str, Any]:
-        domain = url.split("//")[-1].split("/")[0].lower()
+        #domain = url.split("//")[-1].split("/")[0].lower()
+        parsed = urlparse(url)
+
+        host = parsed.netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+
+        # take first path segment only (e.g. /en)
+        path_parts = [p for p in parsed.path.split("/") if p]
+        lang = path_parts[0] if path_parts else ""
+
+        domain = f"{host}/{lang}" if lang else host
+
 
         # Normalize domain key
         if domain.startswith("www."):
@@ -269,7 +282,7 @@ class ArticleContent(BaseModel):
     category: List[str] = []
 
 # --------------------
-# CATEGORY CLASSIFIER (same as Code 1)
+# CATEGORY CLASSIFIER 
 # --------------------
 async def classify_category(title: str, snippet: str) -> List[str]:
     prompt_text = f"""
@@ -337,7 +350,7 @@ async def scrape_site(site_name: str, site_url: str):
             try:
                 url = link.get("url")
 
-                # ✅ URL NORMALIZATION (same as Code 1)
+                # ✅ URL NORMALIZATION 
                 if url and not url.startswith("http"):
                     url = urljoin(site_url, url)
 
@@ -366,8 +379,6 @@ async def scrape_site(site_name: str, site_url: str):
             except Exception:
                 traceback.print_exc()
 
-        # DynamoDB version: dedupe using today's region data
-        
 
 
         site_name_from_db = metadata.get("site_name", site_name)
@@ -387,7 +398,6 @@ async def scrape_site(site_name: str, site_url: str):
 
 
 
-        # Save exactly like Code 1
         save_articles(site_name, final_news, metadata.get("region", "Unknown"))
         return final_news
 
@@ -400,7 +410,10 @@ async def scrape_site(site_name: str, site_url: str):
 # --------------------
 async def scrape_background(request: ScrapeRequest):
     try:
-        site_name = request.url.split("//")[-1].split("/")[0]
+        
+
+        parsed = urlparse(request.url)
+        site_name = parsed.netloc
         await scrape_site(site_name, request.url)
     except Exception:
         traceback.print_exc()
