@@ -225,7 +225,7 @@ class NewsExtractor:
     def process_url(self, url: str) -> Dict[str, Any]:
         domain = url.split("//")[-1].split("/")[0].lower()
 
-        # ✅ FIX: normalize domain key
+        # Normalize domain key
         if domain.startswith("www."):
             domain = domain.replace("www.", "", 1)
 
@@ -240,15 +240,17 @@ class NewsExtractor:
                 else:
                     metadata[k] = v
 
+            # ✅ Extract site name from DynamoDB
+            metadata["site_name"] = item.get("name") or item.get("site_name") or domain
+
             return metadata
 
         except KeyError:
             return {
                 "prompt": "Summarize this news page into a JSON object with title and content.",
-                "region": "Unknown"
+                "region": "Unknown",
+                "site_name": domain  # fallback
             }
-
-
 
 # --------------------
 # SCHEMAS
@@ -368,11 +370,13 @@ async def scrape_site(site_name: str, site_url: str):
         
 
 
+        site_name_from_db = metadata.get("site_name", site_name)
+
         final_news = [
             {
                 "date": a.get("date"),
                 "details": a.get("details"),
-                "source": site_name,
+                "source": site_name_from_db,  # ✅ now uses the actual site name
                 "title": a.get("title"),
                 "category": a.get("category", []),
                 "url": a.get("source_url")
@@ -380,6 +384,7 @@ async def scrape_site(site_name: str, site_url: str):
             for a in all_articles
             if a.get("title") or a.get("details")
         ]
+
 
 
         # Save exactly like Code 1
