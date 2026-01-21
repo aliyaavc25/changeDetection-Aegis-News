@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 import httpx
+import asyncio
 
 from pydantic import BaseModel,Field,ConfigDict
 from typing import Optional
@@ -42,10 +43,18 @@ async def trigger(notification: AppriseNotification):
     #url = request_data.url
     #prompt = request_data.prompt
     # 1. Parse the string inside 'message' into our ScrapeData model
-    raw_data = json.loads(notification.message, strict=False)
+    raw_data = {
+        "base_url": notification.title.replace("ChangeDetection.io Notification - ", ""),
+        "changes": notification.message,
+        "current_snapshot": None,
+        "prompt": "Extract the news headlines and details"
+    }
+
     # --- NEW PRINT LOG ---
     print("\n--- INCOMING PAYLOAD FROM CHANGEDETECTION ---")
-    print(json.dumps(raw_data, indent=2)) # Formats the payload for readability
+    #print(json.dumps(raw_data, indent=2)) # Formats the payload for readability
+    print("Incoming payload keys:", raw_data.keys())
+
     print("---------------------------------------------\n")
     request_data = ScrapeData(**raw_data)
 
@@ -56,17 +65,18 @@ async def trigger(notification: AppriseNotification):
         "prompt": request_data.prompt
     }
     #print(f"Scraping: {url}")
-    custom_timeout = httpx.Timeout(300.0, connect=10.0)
-    #return {"message": "Success", "url": url}
-    async with httpx.AsyncClient(timeout=custom_timeout) as client:
-        try:
-            response = await client.post(
-                "http://localhost:8001/scrape", 
-                json=payload
-            )
-            return response.json()
-        except httpx.TimeoutException:
-            return {"error": "The scraper took too long to respond. Try a simpler prompt."}
+    custom_timeout = httpx.Timeout(5.0)
+
+    asyncio.create_task(
+        httpx.AsyncClient(timeout=custom_timeout).post(
+            "http://localhost:8001/scrape",
+            json=payload
+        )
+    )
+
+
+    return {"status": "received"}
+
 
 
 if __name__ == "__main__":
