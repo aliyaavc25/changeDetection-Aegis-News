@@ -18,6 +18,9 @@ from boto3.dynamodb.conditions import Key
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
 
+from datetime import datetime, timezone, timedelta
+import time
+
 
 # --------------------
 # STEP 1: LOAD ENV
@@ -129,24 +132,26 @@ class ScrapeRequest(BaseModel):
 RESULTS_DIR = "results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
+MY_TZ = timezone(timedelta(hours=8))
+
+
 
 
 def normalize_date(date_str: str) -> str:
-    """
-    Converts a datetime string to YYYY-MM-DD format
-    """
     if not date_str:
-        return datetime.utcnow().strftime("%Y-%m-%d")
+        return datetime.now(MY_TZ).strftime("%Y-%m-%d")
     try:
         dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-        return dt.strftime("%Y-%m-%d")
+        return dt.astimezone(MY_TZ).strftime("%Y-%m-%d")
     except Exception:
-        return datetime.utcnow().strftime("%Y-%m-%d")
+        return datetime.now(MY_TZ).strftime("%Y-%m-%d")
+
 
 
 
 def save_articles(site_name: str, articles: List[Dict[str, Any]], region: str):
-    date_key = normalize_date(datetime.utcnow().isoformat())
+    date_key = normalize_date(datetime.now(MY_TZ).isoformat())
+
     
     print(f"\n🔹 [DEBUG] save_articles called for site: {site_name}")
     print(f"    Region: {region}, Date Key: {date_key}")
@@ -154,12 +159,15 @@ def save_articles(site_name: str, articles: List[Dict[str, Any]], region: str):
     
     # 1️⃣ Load existing item
     try:
-        response = REGIONAL_NEWS_TABLE.get_item(
-            Key={"region": region, "generatedAt": date_key}
+        response = dynamodb_with_retry(
+            lambda: REGIONAL_NEWS_TABLE.get_item(
+                Key={"region": region, "generatedAt": date_key}
+            )
         )
     except Exception as e:
-        print("❌ Error fetching existing item from DynamoDB:", e)
+        print("❌ Failed to fetch from DynamoDB after retries:", e)
         response = {}
+
 
     existing_item = response.get("Item")
     existing_news = existing_item.get("news", []) if existing_item else []
@@ -179,29 +187,40 @@ def save_articles(site_name: str, articles: List[Dict[str, Any]], region: str):
 
     # 3️⃣ Update ONLY if new news exists
     try:
-        REGIONAL_NEWS_TABLE.update_item(
-            Key={"region": region, "generatedAt": date_key},
-            UpdateExpression="""
-                SET #news = list_append(if_not_exists(#news, :empty), :new),
-                    #count = if_not_exists(#count, :zero) + :inc,
-                    #date = :date
-            """,
-            ExpressionAttributeNames={
-                "#news": "news",
-                "#count": "count",
-                "#date": "date",
-            },
-            ExpressionAttributeValues={
-                ":new": new_articles,
-                ":empty": [],
-                ":inc": len(new_articles),
-                ":zero": 0,
-                ":date": date_key,
-            },
+        dynamodb_with_retry(
+            lambda: REGIONAL_NEWS_TABLE.update_item(
+                Key={"region": region, "generatedAt": date_key},
+                UpdateExpression="""
+                    SET #news = list_append(if_not_exists(#news, :empty), :new),
+                        #count = if_not_exists(#count, :zero) + :inc,
+                        #date = :date
+                """,
+                ExpressionAttributeNames={
+                    "#news": "news",
+                    "#count": "count",
+                    "#date": "date",
+                },
+                ExpressionAttributeValues={
+                    ":new": new_articles,
+                    ":empty": [],
+                    ":inc": len(new_articles),
+                    ":zero": 0,
+                    ":date": date_key,
+                },
+            )
         )
+
         print(f"    ✅ Successfully updated DynamoDB with {len(new_articles)} new articles")
+
     except Exception as e:
-        print("❌ Error updating DynamoDB:", e)
+        print("❌ Failed to update DynamoDB after retries:", e)
+        print("⚠️ Writing local JSON backup to disk...")
+
+        save_local_backup(
+            region=region,
+            date_key=date_key,
+            articles=new_articles,
+        )
 
 
 
@@ -218,6 +237,42 @@ def merge_new_articles(existing, new):
         new_valid.append(a)
         
     return existing_valid + new_valid
+
+def dynamodb_with_retry(fn, retries=3, delay=1):
+    last_exc = None
+    for attempt in range(1, retries + 1):
+        try:
+            return fn()
+        except Exception as e:
+            last_exc = e
+            print(f"⚠️ DynamoDB attempt {attempt} failed: {e}")
+            if attempt < retries:
+                time.sleep(delay * attempt)  # simple backoff
+    raise last_exc
+
+
+def save_local_backup(region: str, date_key: str, articles: list):
+    try:
+        filename = f"backup_{region}_{date_key}.json"
+        path = os.path.join(RESULTS_DIR, filename)
+
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "region": region,
+                    "date": date_key,
+                    "count": len(articles),
+                    "articles": articles,
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        print(f"💾 Local backup saved: {path}")
+
+    except Exception as e:
+        print("❌ Failed to write local backup:", e)
 
 # --------------------
 # NEWS EXTRACTOR
@@ -343,7 +398,7 @@ async def scrape_site(site_name: str, site_url: str):
         if hasattr(result, "model_dump"):
             result = result.model_dump()
 
-        links = result.get("news", [])[:2]
+        links = result.get("news", [])[:5]
         all_articles = []
 
         for idx, link in enumerate(links, start=1):
@@ -358,7 +413,10 @@ async def scrape_site(site_name: str, site_url: str):
 
                 categories = await classify_category(title or "", title or "")
                 if not categories:
+                    print(f"    ⏭️  SKIPPED: '{title}' from {url}")
+                    print(f"        Reason: No matching categories from {CATEGORIES}")
                     continue
+
 
                 article_graph = SmartScraperGraph(
                     prompt=metadata["prompt"],
