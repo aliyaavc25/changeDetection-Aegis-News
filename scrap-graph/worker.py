@@ -458,7 +458,7 @@ async def scrape_site(site_name: str, site_url: str):
         if hasattr(result, "model_dump"):
             result = result.model_dump()
 
-        MAX_ARTICLES_PER_SITE = 5
+        MAX_ARTICLES_PER_SITE = 3
         links = result.get("news", [])[:MAX_ARTICLES_PER_SITE]
         all_articles = []
 
