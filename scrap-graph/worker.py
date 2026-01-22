@@ -7,7 +7,7 @@ import asyncio
 from typing import List, Optional, Dict, Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel
 
 from langchain_aws import ChatBedrockConverse
@@ -26,16 +26,6 @@ import time
 # STEP 1: LOAD ENV
 # --------------------
 load_dotenv()
-
-#AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
-#AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-#AWS_DEFAULT_REGION = os.getenv("AWS_DEFAULT_REGION")
-
-
-
-#if not all([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION]):
- #   print("❌ Missing AWS credentials in environment variables!")
-   # sys.exit(1)
 
 AWS_REGION = "ap-southeast-5"
 
@@ -169,12 +159,8 @@ def save_articles(site_name: str, articles: List[Dict[str, Any]], region: str):
         response = {}
 
 
-    existing_item = response.get("Item")
-    existing_news = existing_item.get("news", []) if existing_item else []
-    print(f"    Existing articles in DynamoDB: {len(existing_news)}")
-    
-    # 2️⃣ De-duplicate by URL
-    existing_urls = {a.get("url") for a in existing_news if a.get("url")}
+    # 🔒 FULL-REGION DEDUPLICATION
+    existing_urls = dynamodb_with_retry(lambda: get_existing_urls_for_region(region))
     new_articles = [a for a in articles if a.get("url") not in existing_urls]
 
     print(f"    New articles to insert: {len(new_articles)}")
@@ -222,22 +208,6 @@ def save_articles(site_name: str, articles: List[Dict[str, Any]], region: str):
             articles=new_articles,
         )
 
-
-
-def merge_new_articles(existing, new):
-    existing_valid = [a for a in existing if isinstance(a, dict)]
-    existing_urls = {a.get("url") for a in existing_valid if a.get("url")}
-    
-    new_valid = []
-    for a in new:
-        if not isinstance(a, dict):
-            continue
-        if a.get("source_url") in existing_urls:
-            continue
-        new_valid.append(a)
-        
-    return existing_valid + new_valid
-
 def dynamodb_with_retry(fn, retries=3, delay=1):
     last_exc = None
     for attempt in range(1, retries + 1):
@@ -273,6 +243,11 @@ def save_local_backup(region: str, date_key: str, articles: list):
 
     except Exception as e:
         print("❌ Failed to write local backup:", e)
+
+def normalize_url(base: str, url: str) -> str:
+    if not url:
+        return ""
+    return url if url.startswith("http") else urljoin(base, url)
 
 # --------------------
 # NEWS EXTRACTOR
@@ -319,7 +294,20 @@ class NewsExtractor:
                 "region": "Unknown",
                 "site_name": domain  # fallback
             }
-
+def get_existing_urls_for_region(region: str) -> set:
+    urls = set()
+    try:
+        response = REGIONAL_NEWS_TABLE.query(
+            KeyConditionExpression=Key("region").eq(region)
+        )
+        items = response.get("Items", [])
+        for item in items:
+            for article in item.get("news", []):
+                if article.get("url"):
+                    urls.add(article["url"])
+    except Exception as e:
+        print("⚠️ Failed to fetch existing URLs:", e)
+    return urls
 # --------------------
 # SCHEMAS
 # --------------------
@@ -368,6 +356,65 @@ async def classify_category(title: str, snippet: str) -> List[str]:
     except Exception:
         return []
 
+async def translate_article_if_needed(
+    title: str,
+    details: str
+) -> Dict[str, str]:
+    """
+    Detect language per field and translate non-English parts to English.
+    Handles mixed-language (Indonesian / Chinese / English).
+    Single Bedrock call.
+    """
+    prompt = f"""
+    You are a professional news translator.
+
+    Tasks:
+    1. Detect the language of EACH field separately.
+    2. If a field contains any non-English content, translate ONLY that content to English.
+    3. Preserve existing English text exactly as-is.
+    4. Do NOT summarize, shorten, or rewrite.
+    5. Preserve names, numbers, dates, and journalistic tone.
+
+    Return ONLY valid JSON in this exact format:
+    {{
+      "title": "...",
+      "details": "..."
+    }}
+
+    Title:
+    {title}
+
+    Details:
+    {details}
+    """
+
+    try:
+        response = await bedrock_llm.ainvoke(
+            [HumanMessage(content=prompt)]
+        )
+
+        content = response.content
+
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0].strip()
+        elif "```" in content:
+            content = content.split("```")[1].split("```")[0].strip()
+
+        data = json.loads(content)
+
+        return {
+            "title": data.get("title", title),
+            "details": data.get("details", details),
+        }
+
+    except Exception as e:
+        print("⚠️ Translation failed, using original text:", e)
+        return {
+            "title": title,
+            "details": details,
+        }
+
+
 # --------------------
 # SCRAPE SITE
 # --------------------
@@ -376,6 +423,19 @@ async def scrape_site(site_name: str, site_url: str):
         extractor = NewsExtractor()
 
         metadata = extractor.process_url(site_url)
+
+        # ================================
+        # 🔒 PRELOAD EXISTING URLS (EARLY DEDUP)
+        # ================================
+        # 🔒 PRELOAD EXISTING URLS (EARLY DEDUP)
+        region = metadata.get("region", "Unknown")
+
+        existing_urls = dynamodb_with_retry(
+            lambda: get_existing_urls_for_region(region)
+        )
+
+        print(f"🔎 Found {len(existing_urls)} existing URLs for this region")
+
 
         list_prompt = """
         Extract a list of news articles.
@@ -398,26 +458,23 @@ async def scrape_site(site_name: str, site_url: str):
         if hasattr(result, "model_dump"):
             result = result.model_dump()
 
-        links = result.get("news", [])[:5]
+        MAX_ARTICLES_PER_SITE = 5
+        links = result.get("news", [])[:MAX_ARTICLES_PER_SITE]
         all_articles = []
 
         for idx, link in enumerate(links, start=1):
             try:
-                url = link.get("url")
+                url = normalize_url(site_url, link.get("url"))
 
-                # ✅ URL NORMALIZATION 
-                if url and not url.startswith("http"):
-                    url = urljoin(site_url, url)
+                # 🚫 HARD STOP — already stored
+                if url in existing_urls:
+                    print(f"    ⏭️  SKIPPED (already stored): {url}")
+                    
+                    continue
 
                 title = link.get("title")
 
-                categories = await classify_category(title or "", title or "")
-                if not categories:
-                    print(f"    ⏭️  SKIPPED: '{title}' from {url}")
-                    print(f"        Reason: No matching categories from {CATEGORIES}")
-                    continue
-
-
+                # 1️⃣ SCRAPE ARTICLE FIRST
                 article_graph = SmartScraperGraph(
                     prompt=metadata["prompt"],
                     source=url,
@@ -429,10 +486,36 @@ async def scrape_site(site_name: str, site_url: str):
                 if hasattr(article, "model_dump"):
                     article = article.model_dump()
 
+                # 2️⃣ CLASSIFY USING REAL CONTENT
+                categories = await classify_category(
+                    article.get("title", title or ""),
+                    article.get("details", "")
+                )
+
+                if not categories:
+                    print(f"    ⏭️  SKIPPED AFTER SCRAPE (no category): {url}")
+                    continue
+
+            
+               
+
                 article["title"] = article.get("title") or title
                 article["category"] = categories
                 article["source_url"] = url
+
+                # 🌍 CONDITIONAL TRANSLATION
+                if metadata.get("translate_to_en") is True:
+                    translated = await translate_article_if_needed(
+                        article.get("title", ""),
+                        article.get("details", "")
+                    )
+                    print("🌍 TRANSLATED TITLE:", translated["title"])
+                    print("🌍 TRANSLATED DETAILS:", translated["details"][:120], "...")
+                    article["title"] = translated["title"]
+                    article["details"] = translated["details"]
+
                 all_articles.append(article)
+
 
             except Exception:
                 traceback.print_exc()
@@ -456,7 +539,12 @@ async def scrape_site(site_name: str, site_url: str):
 
 
 
-        save_articles(site_name, final_news, metadata.get("region", "Unknown"))
+        save_articles(
+            site_name=metadata.get("site_name", site_name),
+            articles=final_news,
+            region=metadata.get("region", "Unknown"),
+        )
+
         return final_news
 
     except Exception:
