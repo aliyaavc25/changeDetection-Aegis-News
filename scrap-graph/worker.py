@@ -265,7 +265,7 @@ class NewsExtractor:
         path_parts = [p for p in parsed.path.split("/") if p]
         lang = path_parts[0] if path_parts else ""
 
-        domain = f"{host}/{lang}" if lang else host
+        domain = (f"{host}/{lang}" if lang else host).rstrip("/")
 
 
         # Normalize domain key
@@ -427,7 +427,6 @@ async def scrape_site(site_name: str, site_url: str):
         # ================================
         # 🔒 PRELOAD EXISTING URLS (EARLY DEDUP)
         # ================================
-        # 🔒 PRELOAD EXISTING URLS (EARLY DEDUP)
         region = metadata.get("region", "Unknown")
 
         existing_urls = dynamodb_with_retry(
