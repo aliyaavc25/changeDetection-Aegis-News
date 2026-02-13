@@ -22,11 +22,12 @@ MY_TZ = timezone(timedelta(hours=TIMEZONE_OFFSET))
 
 MAX_CONCURRENT_SCRAPES = int(os.getenv("MAX_CONCURRENT_SCRAPES", 3))
 MAX_CONCURRENT_LLM = int(os.getenv("MAX_CONCURRENT_LLM", 2))
+MAX_CONCURRENT_ARTICLE = int(os.getenv("MAX_CONCURRENT_ARTICLE", 3))
 
 MAX_ARTICLES_PER_SITE = int(os.getenv("MAX_ARTICLES_PER_SITE", 5))
 
 QUEUE_MAXSIZE = int(os.getenv("QUEUE_MAXSIZE", 500))  # max number of queued scrape requests
-WORKER_COUNT = int(os.getenv("WORKER_COUNT", 1)) 
+WORKER_COUNT = int(os.getenv("WORKER_COUNT", 2)) 
 
 # --------------------
 # DYNAMODB
