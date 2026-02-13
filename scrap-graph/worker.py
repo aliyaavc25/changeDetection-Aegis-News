@@ -61,6 +61,7 @@ from config import (
     MY_TZ,
     MAX_CONCURRENT_SCRAPES,
     MAX_CONCURRENT_LLM,
+    MAX_CONCURRENT_ARTICLE,
     MAX_ARTICLES_PER_SITE,
     PROMPT_LIST_ARTICLES,
     PROMPT_EXTRACT_ARTICLE,
@@ -96,6 +97,8 @@ logger = logging.getLogger(__name__)
 # ------------------------------------------------------------------
 scrape_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SCRAPES)
 llm_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM)
+article_semaphore = asyncio.Semaphore(MAX_CONCURRENT_ARTICLE)
+
 
 # ------------------------------------------------------------------
 # FASTAPI
@@ -265,15 +268,13 @@ async def translate_article_if_needed(title: str, details: str) -> Dict[str, str
 # ------------------------------------------------------------------
 # SAVE ARTICLES
 # ------------------------------------------------------------------
-def save_articles(site_name: str, articles: List[Dict[str, Any]], region: str):
+def save_articles(site_name: str, articles: List[Dict[str, Any]], region: str, existing_urls):
     for a in articles:
         a["date"] = normalize_date(a.get("date"))
 
     date_key = normalize_date(articles[0]["date"]) if articles else normalize_date(None)
 
-    existing_urls = dynamodb_with_retry(
-        lambda: get_existing_urls_for_region(region)
-    )
+    
 
     new_articles = [
         a for a in articles if a.get("url") not in existing_urls
@@ -312,6 +313,80 @@ def save_articles(site_name: str, articles: List[Dict[str, Any]], region: str):
         logger.exception("DynamoDB update failed")
         save_local_backup(region, date_key, new_articles)
 
+# ------------------------------------------------------------------
+# ARCTICLE PROCESS
+# ------------------------------------------------------------------
+async def process_article_link(
+    link,
+    site_url: str,
+    site_name: str,
+    metadata: dict,
+    existing_urls: set,
+):
+    async with article_semaphore:
+        try:
+            url = normalize_url(site_url, link.get("url"))
+            if not url or url in existing_urls:
+                return None
+
+            raw_graph = SmartScraperGraph(
+                prompt=PROMPT_EXTRACT_ARTICLE,
+                source=url,
+                config={
+                    **GRAPH_CONFIG,
+                    "llm": {"model_instance": HELPER_LLM, "model_tokens": 2048},
+                },
+                schema=RawArticle,
+            )
+
+            raw = await run_graph_safe(raw_graph)
+            raw = raw.model_dump() if hasattr(raw, "model_dump") else raw
+
+            if len((raw.get("text") or "").strip()) < 150:
+                return None
+
+            sonnet_prompt = PROMPT_STRUCTURE_ARTICLE.format(
+                article_text=raw["text"][:12000]
+            )
+
+            try:
+                sonnet_resp = await llm_call_safe(
+                    lambda: SCRAPER_LLM.ainvoke(
+                        [HumanMessage(content=sonnet_prompt)]
+                    )
+                )
+            except Exception:
+                sonnet_resp = await llm_call_safe(
+                    lambda: SCRAPER_FALLBACK_LLM.ainvoke(
+                        [HumanMessage(content=sonnet_prompt)]
+                    )
+                )
+
+            article = extract_json(sonnet_resp.content)
+
+            categories = await classify_category(
+                article.get("title", ""),
+                article.get("details", ""),
+            )
+            if not categories:
+                return None
+
+            article["category"] = categories
+            article["source"] = metadata.get("site_name", site_name)
+            article["url"] = url
+
+            if metadata.get("translate_to_en"):
+                translated = await translate_article_if_needed(
+                    article["title"],
+                    article["details"],
+                )
+                article.update(translated)
+
+            return article
+
+        except Exception:
+            logger.exception("Failed processing article")
+            return None
 
 # ------------------------------------------------------------------
 # SCRAPE SITE
@@ -339,81 +414,34 @@ async def scrape_site(site_name: str, site_url: str):
     result = await run_graph_safe(main_graph)
     result = result.model_dump() if hasattr(result, "model_dump") else result
 
-    articles = []
+    links = result.get("news", [])[:MAX_ARTICLES_PER_SITE]
 
-    for link in result.get("news", [])[:MAX_ARTICLES_PER_SITE]:
-        try:
-            url = normalize_url(site_url, link.get("url"))
-            if url in existing_urls:
-                continue
+    tasks = [
+        process_article_link(
+            link=link,
+            site_url=site_url,
+            site_name=site_name,
+            metadata=metadata,
+            existing_urls=existing_urls,
+        )
+        for link in links
+    ]
 
-            pre_cat = await classify_category(link.get("title") or "", "")
-            if not pre_cat:
-                continue
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            raw_graph = SmartScraperGraph(
-                prompt=PROMPT_EXTRACT_ARTICLE,
-                source=url,
-                config={
-                    **GRAPH_CONFIG,
-                    "llm": {"model_instance": HELPER_LLM, "model_tokens": 2048},
-                },
-                schema=RawArticle,
-            )
+    articles = [
+        r for r in results
+        if isinstance(r, dict)
+    ]
 
-            raw = await run_graph_safe(raw_graph)
-            raw = raw.model_dump() if hasattr(raw, "model_dump") else raw
-
-            if len((raw.get("text") or "").strip()) < 150:
-                continue
-
-            sonnet_prompt = PROMPT_STRUCTURE_ARTICLE.format(
-                article_text=raw["text"][:12000]
-            )
-
-            try:
-                sonnet_resp = await llm_call_safe(
-                    lambda: SCRAPER_LLM.ainvoke(
-                        [HumanMessage(content=sonnet_prompt)]
-                    )
-                )
-            except Exception:
-                sonnet_resp = await llm_call_safe(
-                    lambda: SCRAPER_FALLBACK_LLM.ainvoke(
-                        [HumanMessage(content=sonnet_prompt)]
-                    )
-                )
-
-            article = extract_json(sonnet_resp.content)
-
-            categories = await classify_category(
-                article.get("title", ""),
-                article.get("details", ""),
-            )
-            if not categories:
-                continue
-
-            article["category"] = categories
-            article["source"] = metadata.get("site_name", site_name)
-            article["url"] = url
-
-            if metadata.get("translate_to_en"):
-                translated = await translate_article_if_needed(
-                    article["title"],
-                    article["details"],
-                )
-                article.update(translated)
-
-            articles.append(article)
-
-        except Exception:
-            logger.exception("Failed processing article")
 
     save_articles(
         site_name=metadata.get("site_name", site_name),
         articles=articles,
         region=region,
+        existing_urls=existing_urls,
     )
+
 
     return articles
 
